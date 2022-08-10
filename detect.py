@@ -23,12 +23,31 @@ Usage - formats:
                                          yolov5s.tflite             # TensorFlow Lite
                                          yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
 """
-
+import cv2
 import argparse
 import os
-import platform
 import sys
 from pathlib import Path
+import numpy as np
+
+import albumentations as a
+import cv2 
+from PIL import Image
+import numpy as np
+from albumentations.augmentations.transforms import InvertImg
+from albumentations.augmentations.transforms import RandomBrightnessContrast
+
+
+from matplotlib import pyplot as plt
+from PIL import Image, ImageDraw
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Layer, Conv2D, Dense, MaxPooling2D, Input, Flatten
+import tensorflow as tf
+
+from utils.general import (CONFIG_DIR, FONT, LOGGER, Timeout, check_font, check_requirements, clip_coords,
+                           increment_path, is_ascii, threaded, try_except, xywh2xyxy, xyxy2xywh)
+from utils.metrics import fitness
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -94,6 +113,11 @@ def run(
     stride, names, pt = model.stride, model.names, model.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 
+    I_model = tf.keras.models.load_model('./inceptionv22.6225975e-06LOSS.h5',
+                                   custom_objects={'L1Dist':L1Dist, 'BinaryCrossentropy':tf.losses.BinaryCrossentropy})
+    
+
+
     # Dataloader
     if webcam:
         view_img = check_imshow()
@@ -107,7 +131,7 @@ def run(
 
     # Run inference
     model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
-    seen, windows, dt = 0, [], [0.0, 0.0, 0.0]
+    dt, seen = [0.0, 0.0, 0.0], 0
     for path, im, im0s, vid_cap, s in dataset:
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)
@@ -139,7 +163,7 @@ def run(
                 s += f'{i}: '
             else:
                 p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
-
+            print(det)
             p = Path(p)  # to Path
             save_path = str(save_dir / p.name)  # im.jpg
             txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
@@ -158,6 +182,7 @@ def run(
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
+                    crop = get_crop_label(xyxy,imc,I_model)
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -167,17 +192,13 @@ def run(
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+                        annotator.box_label(xyxy, str(crop), color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
             # Stream results
             im0 = annotator.result()
             if view_img:
-                if platform.system() == 'Linux' and p not in windows:
-                    windows.append(p)
-                    cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
-                    cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
                 cv2.imshow(str(p), im0)
                 cv2.waitKey(1)  # 1 millisecond
 
@@ -210,8 +231,19 @@ def run(
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
-        strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
+        strip_optimizer(weights)  # update model (to fix SourceChangeWarning)
 
+
+# Siamese L1 Distance class
+class L1Dist(Layer):
+    
+    # Init method - inheritance
+    def __init__(self, **kwargs):
+        super().__init__()
+       
+    # Magic happens here - similarity calculation
+    def call(self, input_embedding, validation_embedding):
+        return tf.math.abs(input_embedding - validation_embedding)
 
 def parse_opt():
     parser = argparse.ArgumentParser()
@@ -250,6 +282,83 @@ def parse_opt():
 def main(opt):
     check_requirements(exclude=('tensorboard', 'thop'))
     run(**vars(opt))
+
+def preprocess_img(im):
+    img = tf.image.resize(im, (100,100))
+    # Scale image to be between 0 and 1 
+    img = img / 255.0
+
+    # Return image
+    return img
+
+
+    
+def preprocess(file_path):
+    
+    # Read in image from file path
+    byte_img = tf.io.read_file(file_path)
+    # Load in the image 
+    img = tf.io.decode_jpeg(byte_img)
+    
+    # Preprocessing steps - resizing the image to be 100x100x3
+    img = tf.image.resize(img, (100,100))
+    # Scale image to be between 0 and 1 
+    img = img / 255.0
+
+    # Return image
+    return img
+
+def preprocess_twin(input_img, validation_img, label):
+    return(preprocess(input_img), preprocess(validation_img), label)
+
+def make_embedding(): 
+    inp = Input(shape=(100,100,3), name='input_image')
+    
+    # First block
+    c1 = Conv2D(64, (10,10), activation='relu')(inp)
+    m1 = MaxPooling2D(64, (2,2), padding='same')(c1)
+    
+    # Second block
+    c2 = Conv2D(128, (7,7), activation='relu')(m1)
+    m2 = MaxPooling2D(64, (2,2), padding='same')(c2)
+    
+    # Third block 
+    c3 = Conv2D(128, (4,4), activation='relu')(m2)
+    m3 = MaxPooling2D(64, (2,2), padding='same')(c3)
+    
+    # Final embedding block
+    c4 = Conv2D(256, (4,4), activation='relu')(m3)
+    f1 = Flatten()(c4)
+    d1 = Dense(4096, activation='sigmoid')(f1)
+    
+    
+    return Model(inputs=[inp], outputs=[d1], name='embedding')
+
+def get_crop_label(xyxy, im,model, gain=1.02, pad=10, square=False):
+    Transfrom = a.Compose([
+                       a.RandomBrightnessContrast(brightness_limit=[-0.51,-0.51], contrast_limit=[0.6,0.6], always_apply=True, p=1),
+                       a.InvertImg(always_apply=True)
+])
+
+    # Save image crop as {file} with crop size multiple {gain} and {pad} pixels. Save and/or return crop
+    xyxy = torch.tensor(xyxy).view(-1, 4)
+    b = xyxy2xywh(xyxy)  # boxes
+    if square:
+        b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # attempt rectangle to square
+    b[:, 2:] = b[:, 2:] * gain + pad  # box wh * gain + pad
+    xyxy = xywh2xyxy(b).long()
+    clip_coords(xyxy, im.shape)
+    crop = im[int(xyxy[0, 1]):int(xyxy[0, 3]), int(xyxy[0, 0]):int(xyxy[0, 2]), ::1]
+    the_crop = Image.fromarray(crop)
+    plt.imshow(the_crop)
+    crop = preprocess_img(crop)
+    crop = tf.image.resize(crop,[100,100])
+    crop = Transfrom(image=np.asarray(crop))['image']
+    chances = model(np.asarray([crop]))
+    # chances = [model([np.asarray([preprocess('./people/'+person)]),np.asarray([preprocess('./people/'+person)])]).numpy()[0][0] for person in people]
+    # print(chances)
+    # print(people)
+    return np.argmax(chances)
 
 
 if __name__ == "__main__":
